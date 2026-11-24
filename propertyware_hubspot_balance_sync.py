@@ -398,8 +398,18 @@ def retrieve_statement_html(page, portfolio_id, report_id):
 # ============================================================
 
 def extract_ending_balance(html):
-    soup = BeautifulSoup(html, "html.parser")
+    """
+    Extract the portfolio-level "Ending Balance" from an Owner Statement.
 
+    Propertyware can include more than one Owner Statement section in the
+    same HTML response (for example, a portfolio owner statement followed
+    by an individual owner's statement). Those sections can repeat the
+    exact same Portfolio Summary.
+
+    Identical repeated balances are accepted. If the repeated summary
+    balances disagree, extraction fails safely rather than guessing.
+    """
+    soup = BeautifulSoup(html, "html.parser")
     matches = []
 
     for row in soup.find_all("tr"):
@@ -415,7 +425,7 @@ def extract_ending_balance(html):
 
         values = [value for value in values if value]
 
-        if not values:
+        if len(values) < 2:
             continue
 
         label = re.sub(
@@ -424,20 +434,34 @@ def extract_ending_balance(html):
             values[0]
         ).strip().rstrip(":")
 
+        # Match only the Portfolio Summary row, not the dated
+        # "Ending Balance as of ..." row in the operating statement.
         if label.casefold() == "ending balance":
-            if len(values) < 2:
-                continue
+            matches.append(money_to_decimal(values[-1]))
 
-            matches.append(values[-1])
-
-    if len(matches) != 1:
+    if not matches:
         raise ValueError(
-            "Expected exactly one summary Ending Balance row; "
-            f"found {len(matches)}."
+            "No Portfolio Summary 'Ending Balance' row was found."
         )
 
-    return money_to_decimal(matches[0])
+    unique_balances = sorted(set(matches))
 
+    if len(unique_balances) > 1:
+        formatted = ", ".join(format(value, ".2f") for value in unique_balances)
+        raise ValueError(
+            "Multiple Portfolio Summary 'Ending Balance' rows contain "
+            f"different values: {formatted}. Skipping to avoid an incorrect update."
+        )
+
+    if len(matches) > 1:
+        log.warning(
+            "Propertyware repeated the Portfolio Summary Ending Balance "
+            "%s times; all values agree at %s. Using the verified common value.",
+            len(matches),
+            format(unique_balances[0], ".2f")
+        )
+
+    return unique_balances[0]
 
 # ============================================================
 # HUBSPOT EXISTING PORTFOLIOS
