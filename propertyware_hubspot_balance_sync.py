@@ -466,7 +466,27 @@ def login(page):
             "and login_failed.png for the message shown by Propertyware."
         )
 
-    log.info("Propertyware login successful. Current URL: %s", page.url)
+    # Diagnostic capture: inspect the page after login submission.
+page.screenshot(
+    path="propertyware_after_login.png",
+    full_page=True
+)
+
+page_text = " ".join(
+    page.locator("body").inner_text().split()
+)[:1500]
+
+log.info(
+    "PROPERTYWARE POST-LOGIN DIAGNOSTICS | URL: %s | TITLE: %s | TEXT: %s",
+    page.url,
+    page.title(),
+    page_text
+)
+
+log.info(
+    "Password fields visible after login: %s",
+    page.locator("input[type='password']:visible").count()
+)
 
 
 # ============================================================
