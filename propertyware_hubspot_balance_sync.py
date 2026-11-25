@@ -381,112 +381,167 @@ def is_login_page(page):
         return False
 
 
+
 def login(page):
     """
-    Logs in to the Propertyware web app with the automation user.
-    Success is judged by the login form disappearing, NOT by the URL,
-    because the login POST goes to ".../login.do" even when it works.
+    Logs in to Propertyware using the automation user's credentials.
+    Captures diagnostics immediately after login submission so we can
+    investigate authentication failures and unexpected redirects.
     """
+
     log.info("Logging in to Propertyware.")
 
     # Open the login page
     page.goto(
         PW_LOGIN_URL,
         wait_until="domcontentloaded",
-        timeout=120000  # 2 minutes
+        timeout=120000
     )
 
-    # Wait for the password field to appear (confirms the form is loaded)
-    password_field = page.locator("input[type='password']:visible").first
-
-    try:
-        password_field.wait_for(state="visible", timeout=60000)
-    except PlaywrightTimeoutError as exc:
-        # Save a screenshot so the page can be inspected in the workflow artifacts
-        page.screenshot(path="login_form_missing.png", full_page=True)
-        raise LoginError(
-            f"Login form not found at {page.url}. "
-            "Check PW_LOGIN_URL and login_form_missing.png."
-        ) from exc
-
-    # Username field: first visible text or email input on the page
-    username_field = page.locator(
-        "input[type='text']:visible, input[type='email']:visible"
-    ).first
-
-    # Enter the credentials
-    username_field.fill(PW_USERNAME)
-    password_field.fill(PW_PASSWORD)
-
-    # Prefer clicking the submit button; fall back to pressing Enter
-    submit = page.locator(
-        "input[type='submit']:visible, button[type='submit']:visible"
+    # Wait for the password field
+    password_field = page.locator(
+        "input[type='password']:visible"
     ).first
 
     try:
-        # Wait for the page load that the form submission triggers
-        with page.expect_navigation(wait_until="load", timeout=60000):
-            if submit.count() > 0:
-                submit.click()
-            else:
-                password_field.press("Enter")
-    except PlaywrightTimeoutError:
-        pass  # No navigation happened; the page state is checked below
-
-    # Give the post-login page time to replace the login form
-    try:
-        page.locator("input[type='password']:visible").first.wait_for(
-            state="hidden",
-            timeout=30000
+        password_field.wait_for(
+            state="visible",
+            timeout=60000
         )
-    except PlaywrightTimeoutError:
-        pass  # Still showing a password field; handled below
+    except PlaywrightTimeoutError as exc:
+        page.screenshot(
+            path="login_form_missing.png",
+            full_page=True
+        )
 
-    # Let the post-login page finish loading before continuing
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PlaywrightTimeoutError:
-        pass  # The app may keep polling; this is not an error
+        page_text = " ".join(
+            page.locator("body").inner_text().split()
+        )[:1500]
 
-    # Success = the login form is gone
-    if is_login_page(page):
-        page.screenshot(path="login_failed.png", full_page=True)
-
-        # Log what the page says (error message, 2FA prompt, CAPTCHA, ...)
-        page_text = " ".join(page.inner_text("body").split())[:300]
         log.error(
-            "Login page state | URL: %s | Title: %s | Text: %s",
+            "PROPERTYWARE LOGIN FORM MISSING | URL: %s | "
+            "TITLE: %s | TEXT: %s",
             page.url,
             page.title(),
             page_text
         )
 
         raise LoginError(
-            "Propertyware login did not complete. See the log line above "
-            "and login_failed.png for the message shown by Propertyware."
+            f"Login form not found at {page.url}. "
+            "See login_form_missing.png."
+        ) from exc
+
+    # Find the username field
+    username_field = page.locator(
+        "input[type='text']:visible, input[type='email']:visible"
+    ).first
+
+    if username_field.count() == 0:
+        page.screenshot(
+            path="username_field_missing.png",
+            full_page=True
+        )
+        raise LoginError(
+            "Propertyware username field was not found."
         )
 
-    # Diagnostic capture: inspect the page after login submission.
-page.screenshot(
-    path="propertyware_after_login.png",
-    full_page=True
-)
+    # Enter credentials
+    username_field.fill(PW_USERNAME)
+    password_field.fill(PW_PASSWORD)
 
-page_text = " ".join(
-    page.locator("body").inner_text().split()
-)[:1500]
+    # Find the submit button
+    submit = page.locator(
+        "input[type='submit']:visible, "
+        "button[type='submit']:visible"
+    ).first
 
-log.info(
-    "PROPERTYWARE POST-LOGIN DIAGNOSTICS | URL: %s | TITLE: %s | TEXT: %s",
-    page.url,
-    page.title(),
-    page_text
-)
+    # Submit the login form
+    try:
+        with page.expect_navigation(
+            wait_until="domcontentloaded",
+            timeout=60000
+        ):
+            if submit.count() > 0:
+                submit.click()
+            else:
+                password_field.press("Enter")
 
-log.info(
-    "Password fields visible after login: %s",
-    page.locator("input[type='password']:visible").count()
-)
+    except PlaywrightTimeoutError:
+        # Some login forms submit without a full navigation
+        log.info(
+            "No navigation event detected after login submission."
+        )
+
+    # Allow the response to finish
+    try:
+        page.wait_for_load_state(
+            "networkidle",
+            timeout=30000
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    # Allow client-side redirects and page rendering
+    page.wait_for_timeout(3000)
+
+    # Capture diagnostics regardless of the login outcome
+    try:
+        page.screenshot(
+            path="propertyware_after_login.png",
+            full_page=True
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not capture post-login screenshot: %s",
+            exc
+        )
+
+    try:
+        page_text = " ".join(
+            page.locator("body").inner_text().split()
+        )[:1500]
+    except Exception:
+        page_text = "Unable to read page text."
+
+    password_count = page.locator(
+        "input[type='password']:visible"
+    ).count()
+
+    log.info(
+        "PROPERTYWARE POST-LOGIN DIAGNOSTICS | "
+        "URL: %s | TITLE: %s | TEXT: %s",
+        page.url,
+        page.title(),
+        page_text
+    )
+
+    log.info(
+        "Password fields visible after login: %s",
+        password_count
+    )
+
+    # A visible password field means the login form is still present
+    if password_count > 0:
+        page.screenshot(
+            path="login_failed.png",
+            full_page=True
+        )
+
+        log.error(
+            "Propertyware login form is still visible after submission."
+        )
+
+        raise LoginError(
+            "Propertyware login did not complete. "
+            "Review propertyware_after_login.png and login_failed.png "
+            "and the post-login diagnostic log."
+        )
+
+    log.info(
+        "Propertyware login form is no longer visible. "
+        "Post-login state captured for verification. Current URL: %s",
+        page.url
+    )
 
 
 # ============================================================
