@@ -1,3 +1,4 @@
+
 name: Propertyware to HubSpot Portfolio Balance Sync
 
 on:
@@ -37,7 +38,7 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # Run the sync (the script logs in to Propertyware itself)
+      # Run the sync
       - name: Run Propertyware balance sync
         env:
           # Propertyware API credentials
@@ -45,14 +46,14 @@ jobs:
           PW_CLIENT_SECRET: ${{ secrets.PW_CLIENT_SECRET }}
           PW_SYSTEM_ID: ${{ secrets.PW_SYSTEM_ID }}
 
-          # Propertyware web login for the dedicated automation user
+          # Propertyware web login
           PW_USERNAME: ${{ secrets.PW_USERNAME }}
           PW_PASSWORD: ${{ secrets.PW_PASSWORD }}
 
           # HubSpot private app token
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
 
-          # Keep "true" until the dry-run audit has been reviewed
+          # Keep true while validating results
           DRY_RUN: "true"
 
         run: |
@@ -68,12 +69,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # Save debug screenshots (login problems, expired session, Ext timeout)
+      # Save debug screenshots
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: propertyware-debug-screenshots
           path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Save the post-login diagnostic screenshot
+      - name: Upload Propertyware login diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: propertyware-login-diagnostics
+          path: propertyware_after_login.png
           if-no-files-found: ignore
           retention-days: 7
