@@ -1,14 +1,12 @@
 # ============================================================
 # Propertyware -> HubSpot balance sync
-# Pulls each portfolio's Owner Statement from Propertyware and
-# writes Ending Balance / Unpaid Bills to the matching HubSpot
-# custom object record.
+# Logs in to Propertyware on every run (no saved session needed),
+# pulls each portfolio's Owner Statement, and writes Ending Balance
+# and Unpaid Bills to the matching HubSpot custom object record.
 # ============================================================
 
 import os  # Read environment variables (secrets / settings)
 import sys  # Used to exit with a failure code
-import json  # Parse the saved browser state
-import base64  # Decode the base64 browser state secret
 import logging  # Structured log output
 import csv  # Write the audit CSV file
 import re  # Regular expressions for text cleanup
@@ -19,6 +17,7 @@ from urllib.parse import urlencode  # Build the report URL query string
 import requests  # HTTP client for the Propertyware and HubSpot APIs
 from bs4 import BeautifulSoup  # Parse the Owner Statement HTML
 from playwright.sync_api import sync_playwright  # Headless browser automation
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # Playwright timeouts
 
 
 # ============================================================
@@ -27,6 +26,11 @@ from playwright.sync_api import sync_playwright  # Headless browser automation
 
 # Propertyware REST API base URL
 PW_BASE_URL = "https://api.propertyware.com/pw/api/rest/v1"
+# Propertyware web login page (override with PW_LOGIN_URL if it differs)
+PW_LOGIN_URL = os.getenv(
+    "PW_LOGIN_URL",
+    "https://app.propertyware.com/pw/login.jsp"
+)
 # Propertyware web reporting page (used through the browser)
 PW_REPORT_URL = "https://app.propertyware.com/pw/reporting/reports.do"
 
@@ -39,11 +43,13 @@ HUBSPOT_OBJECT_TYPE = "2-11351437"
 PW_CLIENT_ID = os.environ["PW_CLIENT_ID"]
 PW_CLIENT_SECRET = os.environ["PW_CLIENT_SECRET"]
 PW_SYSTEM_ID = os.environ["PW_SYSTEM_ID"]
+
+# Propertyware web login for the dedicated automation user
+PW_USERNAME = os.environ["PW_USERNAME"]
+PW_PASSWORD = os.environ["PW_PASSWORD"]
+
 # HubSpot private app access token
 HUBSPOT_ACCESS_TOKEN = os.environ["HUBSPOT_ACCESS_TOKEN"]
-
-# Base64-encoded logged-in Propertyware browser session
-STORAGE_STATE_B64 = os.environ["PROPERTYWARE_STORAGE_STATE"]
 
 # Keep this true until the dry-run audit has been reviewed.
 # When true, nothing is written to HubSpot.
@@ -82,6 +88,18 @@ logging.basicConfig(
 
 # Named logger used throughout the script
 log = logging.getLogger("PW-HubSpot-Sync")
+
+
+# ============================================================
+# CUSTOM ERRORS
+# ============================================================
+
+class LoginError(RuntimeError):
+    """Raised when the Propertyware login does not succeed."""
+
+
+class SessionExpiredError(RuntimeError):
+    """Raised when Propertyware sends the browser back to the login page."""
 
 
 # ============================================================
@@ -352,71 +370,76 @@ def get_portfolio_name(portfolio):
 
 
 # ============================================================
-# PROPERTYWARE AUTHENTICATED BROWSER
+# PROPERTYWARE BROWSER LOGIN
 # ============================================================
 
-def load_browser_state():
+def login(page):
+    """
+    Logs in to the Propertyware web app with the automation user.
+    Selectors are deliberately generic (any visible password field,
+    first visible text/email field) so small page changes do not break it.
+    """
+    log.info("Logging in to Propertyware.")
+
+    # Open the login page
+    page.goto(
+        PW_LOGIN_URL,
+        wait_until="domcontentloaded",
+        timeout=120000  # 2 minutes
+    )
+
+    # Wait for the password field to appear (confirms the form is loaded)
+    password_field = page.locator("input[type='password']:visible").first
+
     try:
-        # Decode the base64 secret back into raw bytes
-        decoded = base64.b64decode(
-            STORAGE_STATE_B64,
-            validate=True
-        )
-
-        # Parse the bytes as JSON
-        state = json.loads(decoded.decode("utf-8"))
-
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not decode PROPERTYWARE_STORAGE_STATE."
+        password_field.wait_for(state="visible", timeout=60000)
+    except PlaywrightTimeoutError as exc:
+        # Save a screenshot so the page can be inspected in the workflow artifacts
+        page.screenshot(path="login_form_missing.png")
+        raise LoginError(
+            f"Login form not found at {page.url}. "
+            "Check PW_LOGIN_URL and login_form_missing.png."
         ) from exc
 
-    # Playwright does not accept sessionStorage, so split it out
-    session_storage = state.pop("sessionStorage", None)
+    # Username field: first visible text or email input on the page
+    username_field = page.locator(
+        "input[type='text']:visible, input[type='email']:visible"
+    ).first
 
-    if not isinstance(session_storage, dict):
-        raise RuntimeError(
-            "Session storage is missing from the captured browser state."
+    # Enter the credentials
+    username_field.fill(PW_USERNAME)
+    password_field.fill(PW_PASSWORD)
+
+    # Submit the form by pressing Enter in the password field
+    password_field.press("Enter")
+
+    try:
+        # Success = we are no longer on a URL containing "login"
+        page.wait_for_url(
+            lambda url: "login" not in url.lower(),
+            timeout=60000  # 1 minute
         )
+    except PlaywrightTimeoutError as exc:
+        # Still on the login page: wrong credentials, 2FA, CAPTCHA or locked user
+        page.screenshot(path="login_failed.png")
+        raise LoginError(
+            "Propertyware login did not complete. Check the username/password, "
+            "and whether two-factor authentication or a CAPTCHA is blocking "
+            "the automation user (see login_failed.png)."
+        ) from exc
 
-    # The actual key/value pairs live under "entries"
-    entries = session_storage.get("entries", {})
+    # Let the post-login page finish loading before continuing
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass  # The app may keep polling; this is not an error
 
-    if not isinstance(entries, dict) or not entries:
-        raise RuntimeError(
-            "No sessionStorage entries were captured."
-        )
-
-    # Return cookies/localStorage state and the sessionStorage entries
-    return state, entries
+    log.info("Propertyware login successful.")
 
 
-def restore_session_storage(context, entries):
-    """
-    Restore sessionStorage before the Propertyware application loads.
-    This is necessary because Playwright's normal storage-state
-    format does not include sessionStorage.
-    """
-
-    # Convert the entries to a JSON string to embed in JavaScript
-    serialized = json.dumps(entries)
-
-    # JavaScript that runs on every page before the app loads
-    script = f"""
-(() => {{
-    if (location.origin === "https://app.propertyware.com") {{
-        const entries = {serialized};
-
-        for (const [key, value] of Object.entries(entries)) {{
-            sessionStorage.setItem(key, value);
-        }}
-    }}
-}})();
-"""
-
-    # Register the script so it runs on every navigation
-    context.add_init_script(script)
-
+# ============================================================
+# PROPERTYWARE REPORT RETRIEVAL
+# ============================================================
 
 def build_report_url(portfolio_id, report_id):
     # Query parameters that tell Propertyware which report to open
@@ -454,18 +477,33 @@ def retrieve_statement_html(page, portfolio_id, report_id):
         timeout=120000  # 2 minutes
     )
 
-    # A login URL means the saved session is no longer valid
-    if "login" in page.url.lower():
-        raise RuntimeError(
-            "Propertyware redirected to login. "
-            "The saved browser session may have expired."
+    # Let any JavaScript redirects finish before checking the page
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass  # Page may keep polling; carry on to the checks below
+
+    # Detect an expired session (login URL or a password field on the page)
+    if (
+        "login" in page.url.lower()
+        or page.locator("input[type='password']").count() > 0
+    ):
+        page.screenshot(path="session_expired.png")  # Evidence for debugging
+        raise SessionExpiredError(
+            "Propertyware redirected to login during the run."
         )
 
-    # Wait until the Ext JS framework has finished loading
-    page.wait_for_function(
-        "() => window.Ext && window.Ext.Ajax",
-        timeout=60000  # 1 minute
-    )
+    # Wait for the Ext framework; if it never loads, report which page we are on
+    try:
+        page.wait_for_function(
+            "() => window.Ext && window.Ext.Ajax",
+            timeout=60000  # 1 minute
+        )
+    except PlaywrightTimeoutError as exc:
+        page.screenshot(path="ext_timeout.png")
+        raise RuntimeError(
+            f"Ext framework did not load. Current URL: {page.url}"
+        ) from exc
 
     # Run the report refresh inside the page and return its HTML
     result = page.evaluate("""
@@ -735,9 +773,6 @@ def main():
     hubspot_records = get_hubspot_portfolios()
     hubspot_index = build_hubspot_name_index(hubspot_records)
 
-    # Decode the saved login session for the browser
-    browser_state, session_entries = load_browser_state()
-
     results = []  # One audit row per portfolio
 
     # Running totals shown in the final summary
@@ -757,21 +792,16 @@ def main():
             headless=True
         )
 
-        # Create a browser context using the saved cookies/localStorage
-        context = browser.new_context(
-            storage_state=browser_state
-        )
-
-        # Re-inject sessionStorage before pages load
-        restore_session_storage(
-            context,
-            session_entries
-        )
+        # Create a clean browser context (no saved session)
+        context = browser.new_context()
 
         # Open one tab, reused for every portfolio
         page = context.new_page()
 
         try:
+            # Log in once at the start of the run
+            login(page)
+
             for portfolio in propertyware_portfolios:
 
                 counters["processed"] += 1
@@ -825,11 +855,23 @@ def main():
                         )
 
                     # Retrieve and parse the report before matching HubSpot.
-                    html = retrieve_statement_html(
-                        page,
-                        portfolio_id,
-                        report_id
-                    )
+                    try:
+                        html = retrieve_statement_html(
+                            page,
+                            portfolio_id,
+                            report_id
+                        )
+                    except SessionExpiredError:
+                        # Session dropped mid-run: log in again and retry once
+                        log.warning(
+                            "Session expired mid-run. Logging in again."
+                        )
+                        login(page)
+                        html = retrieve_statement_html(
+                            page,
+                            portfolio_id,
+                            report_id
+                        )
 
                     # Extract the verified summary amounts
                     ending_balance, unpaid_bills = (
@@ -923,6 +965,20 @@ def main():
                     else:
                         result["status"] = "UPDATED"
                         counters["updated"] += 1
+
+                except (SessionExpiredError, LoginError) as exc:
+                    # Login cannot be recovered: stop now instead of
+                    # failing every remaining portfolio one by one
+                    result["status"] = f"FAILED - {str(exc)}"
+                    counters["failed"] += 1
+
+                    log.error(
+                        "Stopping run; Propertyware login unavailable: %s",
+                        exc
+                    )
+
+                    results.append(result)
+                    break
 
                 except Exception as exc:
                     # One bad portfolio must not stop the whole run
