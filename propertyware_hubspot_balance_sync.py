@@ -373,11 +373,19 @@ def get_portfolio_name(portfolio):
 # PROPERTYWARE BROWSER LOGIN
 # ============================================================
 
+def is_login_page(page):
+    # A visible password field means we are looking at a login form
+    try:
+        return page.locator("input[type='password']:visible").count() > 0
+    except Exception:
+        return False
+
+
 def login(page):
     """
     Logs in to the Propertyware web app with the automation user.
-    Selectors are deliberately generic (any visible password field,
-    first visible text/email field) so small page changes do not break it.
+    Success is judged by the login form disappearing, NOT by the URL,
+    because the login POST goes to ".../login.do" even when it works.
     """
     log.info("Logging in to Propertyware.")
 
@@ -395,7 +403,7 @@ def login(page):
         password_field.wait_for(state="visible", timeout=60000)
     except PlaywrightTimeoutError as exc:
         # Save a screenshot so the page can be inspected in the workflow artifacts
-        page.screenshot(path="login_form_missing.png")
+        page.screenshot(path="login_form_missing.png", full_page=True)
         raise LoginError(
             f"Login form not found at {page.url}. "
             "Check PW_LOGIN_URL and login_form_missing.png."
@@ -410,23 +418,29 @@ def login(page):
     username_field.fill(PW_USERNAME)
     password_field.fill(PW_PASSWORD)
 
-    # Submit the form by pressing Enter in the password field
-    password_field.press("Enter")
+    # Prefer clicking the submit button; fall back to pressing Enter
+    submit = page.locator(
+        "input[type='submit']:visible, button[type='submit']:visible"
+    ).first
 
     try:
-        # Success = we are no longer on a URL containing "login"
-        page.wait_for_url(
-            lambda url: "login" not in url.lower(),
-            timeout=60000  # 1 minute
+        # Wait for the page load that the form submission triggers
+        with page.expect_navigation(wait_until="load", timeout=60000):
+            if submit.count() > 0:
+                submit.click()
+            else:
+                password_field.press("Enter")
+    except PlaywrightTimeoutError:
+        pass  # No navigation happened; the page state is checked below
+
+    # Give the post-login page time to replace the login form
+    try:
+        page.locator("input[type='password']:visible").first.wait_for(
+            state="hidden",
+            timeout=30000
         )
-    except PlaywrightTimeoutError as exc:
-        # Still on the login page: wrong credentials, 2FA, CAPTCHA or locked user
-        page.screenshot(path="login_failed.png")
-        raise LoginError(
-            "Propertyware login did not complete. Check the username/password, "
-            "and whether two-factor authentication or a CAPTCHA is blocking "
-            "the automation user (see login_failed.png)."
-        ) from exc
+    except PlaywrightTimeoutError:
+        pass  # Still showing a password field; handled below
 
     # Let the post-login page finish loading before continuing
     try:
@@ -434,7 +448,25 @@ def login(page):
     except PlaywrightTimeoutError:
         pass  # The app may keep polling; this is not an error
 
-    log.info("Propertyware login successful.")
+    # Success = the login form is gone
+    if is_login_page(page):
+        page.screenshot(path="login_failed.png", full_page=True)
+
+        # Log what the page says (error message, 2FA prompt, CAPTCHA, ...)
+        page_text = " ".join(page.inner_text("body").split())[:300]
+        log.error(
+            "Login page state | URL: %s | Title: %s | Text: %s",
+            page.url,
+            page.title(),
+            page_text
+        )
+
+        raise LoginError(
+            "Propertyware login did not complete. See the log line above "
+            "and login_failed.png for the message shown by Propertyware."
+        )
+
+    log.info("Propertyware login successful. Current URL: %s", page.url)
 
 
 # ============================================================
@@ -484,10 +516,7 @@ def retrieve_statement_html(page, portfolio_id, report_id):
         pass  # Page may keep polling; carry on to the checks below
 
     # Detect an expired session (login URL or a password field on the page)
-    if (
-        "login" in page.url.lower()
-        or page.locator("input[type='password']").count() > 0
-    ):
+    if is_login_page(page):
         page.screenshot(path="session_expired.png")  # Evidence for debugging
         raise SessionExpiredError(
             "Propertyware redirected to login during the run."
