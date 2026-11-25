@@ -1,7 +1,7 @@
-
 name: Propertyware to HubSpot Portfolio Balance Sync
 
 on:
+  # Allow manual runs from the Actions tab
   workflow_dispatch:
 
   schedule:
@@ -16,38 +16,49 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Download the repository code
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Install Python 3.12
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      # Install the Python packages the script imports
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 playwright
 
+      # Install the headless Chromium browser and its system libraries
       - name: Install Playwright Chromium
         run: |
           python -m playwright install --with-deps chromium
 
+      # Run the sync (the script logs in to Propertyware itself)
       - name: Run Propertyware balance sync
         env:
+          # Propertyware API credentials
           PW_CLIENT_ID: ${{ secrets.PW_CLIENT_ID }}
           PW_CLIENT_SECRET: ${{ secrets.PW_CLIENT_SECRET }}
           PW_SYSTEM_ID: ${{ secrets.PW_SYSTEM_ID }}
 
+          # Propertyware web login for the dedicated automation user
+          PW_USERNAME: ${{ secrets.PW_USERNAME }}
+          PW_PASSWORD: ${{ secrets.PW_PASSWORD }}
+
+          # HubSpot private app token
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
 
-          PROPERTYWARE_STORAGE_STATE: ${{ secrets.PROPERTYWARE_STORAGE_STATE }}
-
+          # Keep "true" until the dry-run audit has been reviewed
           DRY_RUN: "true"
 
         run: |
           python propertyware_hubspot_balance_sync.py
 
+      # Save the audit CSV even if the run failed
       - name: Upload balance audit report
         if: always()
         uses: actions/upload-artifact@v4
@@ -56,3 +67,13 @@ jobs:
           path: propertyware_balance_results.csv
           if-no-files-found: ignore
           retention-days: 14
+
+      # Save debug screenshots (login problems, expired session, Ext timeout)
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: propertyware-debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 7
