@@ -27,13 +27,13 @@ PW_SYSTEM_ID = os.environ["PW_SYSTEM_ID"]
 HUBSPOT_ACCESS_TOKEN = os.environ["HUBSPOT_ACCESS_TOKEN"]
 
 STORAGE_STATE_B64 = os.environ["PROPERTYWARE_STORAGE_STATE"]
-Keep this true until the dry-run audit has been reviewed.
+#Keep this true until the dry-run audit has been reviewed.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = 60
-Default report period: current calendar year to today's date.
-Override either value using GitHub Secrets/Variables if required.
+#Default report period: current calendar year to today's date.
+#Override either value using GitHub Secrets/Variables if required.
 TODAY = date.today()
 START_DATE = os.getenv(
 "STATEMENT_START_DATE",
